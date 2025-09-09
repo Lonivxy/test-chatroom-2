@@ -74,6 +74,10 @@ export default function ChatApp() {
   const [tempTheme, setTempTheme] = useState<Theme>(currentTheme)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const [socket, setSocket] = useState<WebSocket | null>(null)
+  const [connectionStatus, setConnectionStatus] = useState<"connecting" | "connected" | "disconnected">("disconnected")
+  const [serverUrl, setServerUrl] = useState("ws://localhost:8080")
+  const [tempServerUrl, setTempServerUrl] = useState("ws://localhost:8080")
 
   const colorOptions = [
     "#ea580c", // Orange
@@ -185,6 +189,93 @@ export default function ChatApp() {
 
         setCurrentUser(user)
 
+        const connectWebSocket = () => {
+          console.log("[v0] Attempting to connect to WebSocket server:", serverUrl)
+          setConnectionStatus("connecting")
+
+          const ws = new WebSocket(serverUrl)
+
+          ws.onopen = () => {
+            console.log("[v0] WebSocket connected successfully")
+            setConnectionStatus("connected")
+            setSocket(ws)
+
+            // Send user joined message
+            ws.send(
+              JSON.stringify({
+                type: "USER_JOINED",
+                data: user,
+              }),
+            )
+          }
+
+          ws.onmessage = (event) => {
+            const { type, data } = JSON.parse(event.data)
+            console.log("[v0] Received WebSocket message:", type, data)
+
+            switch (type) {
+              case "USER_JOINED":
+                setUsers((prev) => {
+                  const existingUser = prev.find((u) => u.id === data.id)
+                  if (existingUser) {
+                    return prev.map((u) => (u.id === data.id ? { ...data, isOnline: true } : u))
+                  }
+                  return [...prev, { ...data, isOnline: true }]
+                })
+                break
+
+              case "USER_LEFT":
+                setUsers((prev) => prev.map((u) => (u.id === data.id ? { ...u, isOnline: false } : u)))
+                break
+
+              case "NEW_MESSAGE":
+                setMessages((prev) => {
+                  const messageExists = prev.some((m) => m.id === data.id)
+                  if (messageExists) return prev
+                  return [...prev, data]
+                })
+                break
+
+              case "USER_UPDATED":
+                setUsers((prev) => prev.map((u) => (u.id === data.id ? data : u)))
+                break
+
+              case "USERS_LIST":
+                setUsers(data)
+                break
+
+              case "MESSAGES_HISTORY":
+                setMessages(data)
+                break
+            }
+          }
+
+          ws.onclose = () => {
+            console.log("[v0] WebSocket connection closed")
+            setConnectionStatus("disconnected")
+            setSocket(null)
+
+            // Try to reconnect after 3 seconds
+            setTimeout(() => {
+              if (document.visibilityState === "visible") {
+                connectWebSocket()
+              }
+            }, 3000)
+          }
+
+          ws.onerror = (error) => {
+            console.error("[v0] WebSocket error:", error)
+            setConnectionStatus("disconnected")
+          }
+        }
+
+        connectWebSocket()
+
+        const savedMessages = localStorage.getItem("chatMessages")
+        if (savedMessages) {
+          setMessages(JSON.parse(savedMessages))
+        }
+
         const savedTheme = localStorage.getItem("chatTheme")
         if (savedTheme) {
           const theme = JSON.parse(savedTheme)
@@ -195,17 +286,25 @@ export default function ChatApp() {
           applyTheme(currentTheme)
         }
 
-        const savedMessages = localStorage.getItem("chatMessages")
-        if (savedMessages) {
-          setMessages(JSON.parse(savedMessages))
+        const savedServerUrl = localStorage.getItem("chatServerUrl")
+        if (savedServerUrl) {
+          setServerUrl(savedServerUrl)
+          setTempServerUrl(savedServerUrl)
         }
 
-        const savedUsers = localStorage.getItem("chatUsers")
-        if (savedUsers) {
-          setUsers(JSON.parse(savedUsers))
-        } else {
-          setUsers([user])
-          localStorage.setItem("chatUsers", JSON.stringify([user]))
+        const handleBeforeUnload = () => {
+          if (socket && socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({ type: "USER_LEFT", data: user }))
+          }
+        }
+
+        window.addEventListener("beforeunload", handleBeforeUnload)
+
+        return () => {
+          window.removeEventListener("beforeunload", handleBeforeUnload)
+          if (socket) {
+            socket.close()
+          }
         }
       } catch (error) {
         console.error("Error initializing user:", error)
@@ -213,7 +312,7 @@ export default function ChatApp() {
     }
 
     initializeUser()
-  }, [])
+  }, [serverUrl])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
@@ -225,8 +324,15 @@ export default function ChatApp() {
     }
   }, [messages])
 
+  useEffect(() => {
+    if (users.length > 0) {
+      localStorage.setItem("sharedChatUsers", JSON.stringify(users))
+    }
+  }, [users])
+
   const sendMessage = () => {
-    if (!currentUser || (!currentMessage.trim() && !selectedFile)) return
+    if (!currentUser || (!currentMessage.trim() && !selectedFile) || !socket || socket.readyState !== WebSocket.OPEN)
+      return
 
     const newMessage: Message = {
       id: crypto.randomUUID(),
@@ -238,7 +344,8 @@ export default function ChatApp() {
       fileUrl: selectedFile ? URL.createObjectURL(selectedFile) : undefined,
     }
 
-    setMessages((prev) => [...prev, newMessage])
+    socket.send(JSON.stringify({ type: "NEW_MESSAGE", data: newMessage }))
+
     setCurrentMessage("")
     setSelectedFile(null)
 
@@ -270,6 +377,7 @@ export default function ChatApp() {
       setTempUserName(currentUser.name)
       setTempUserColor(currentUser.color)
       setTempTheme(currentTheme)
+      setTempServerUrl(serverUrl)
       setIsSettingsOpen(true)
     }
   }
@@ -286,13 +394,16 @@ export default function ChatApp() {
     setCurrentUser(updatedUser)
     localStorage.setItem("chatUser", JSON.stringify(updatedUser))
 
-    const updatedUsers = users.map((user) => (user.id === currentUser.id ? updatedUser : user))
-    setUsers(updatedUsers)
-    localStorage.setItem("chatUsers", JSON.stringify(updatedUsers))
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "USER_UPDATED", data: updatedUser }))
+    }
 
     setCurrentTheme(tempTheme)
     localStorage.setItem("chatTheme", JSON.stringify(tempTheme))
     applyTheme(tempTheme)
+
+    setServerUrl(tempServerUrl)
+    localStorage.setItem("chatServerUrl", tempServerUrl)
 
     setIsSettingsOpen(false)
   }
@@ -328,6 +439,25 @@ export default function ChatApp() {
       <div className="w-80 bg-sidebar border-r border-sidebar-border flex flex-col">
         {/* Header */}
         <div className="p-4 border-b border-sidebar-border">
+          <div className="flex items-center gap-2 mb-3">
+            <div
+              className={`w-2 h-2 rounded-full ${
+                connectionStatus === "connected"
+                  ? "bg-green-500"
+                  : connectionStatus === "connecting"
+                    ? "bg-yellow-500 animate-pulse"
+                    : "bg-red-500"
+              }`}
+            />
+            <span className="text-xs text-muted-foreground">
+              {connectionStatus === "connected"
+                ? "Connected"
+                : connectionStatus === "connecting"
+                  ? "Connecting..."
+                  : "Disconnected"}
+            </span>
+          </div>
+
           <div className="flex items-center gap-3 mb-4">
             <Avatar className="h-10 w-10">
               <AvatarFallback style={{ backgroundColor: currentUser.color }}>
@@ -355,10 +485,13 @@ export default function ChatApp() {
                   </DialogDescription>
                 </DialogHeader>
                 <Tabs defaultValue="user" className="w-full">
-                  <TabsList className="grid w-full grid-cols-2">
+                  <TabsList className="grid w-full grid-cols-3">
                     <TabsTrigger value="user" className="flex items-center gap-2">
                       <Edit className="h-4 w-4" />
                       Profile
+                    </TabsTrigger>
+                    <TabsTrigger value="server" className="flex items-center gap-2">
+                      🌐 Server
                     </TabsTrigger>
                     <TabsTrigger value="theme" className="flex items-center gap-2">
                       <Paintbrush className="h-4 w-4" />
@@ -413,6 +546,39 @@ export default function ChatApp() {
                           </AvatarFallback>
                         </Avatar>
                         <span className="text-sm text-muted-foreground">Preview</span>
+                      </div>
+                    </div>
+                  </TabsContent>
+
+                  <TabsContent value="server" className="space-y-4">
+                    <div className="grid gap-2">
+                      <Label htmlFor="serverUrl" className="flex items-center gap-2">
+                        🌐 WebSocket Server URL
+                      </Label>
+                      <Input
+                        id="serverUrl"
+                        value={tempServerUrl}
+                        onChange={(e) => setTempServerUrl(e.target.value)}
+                        placeholder="ws://localhost:8080"
+                        className="flex-1"
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        Change this to connect to a different server. Ask your friend for their server URL.
+                      </p>
+                      <div className="mt-2 p-2 bg-muted rounded text-xs">
+                        <p className="font-medium mb-1">Connection Status:</p>
+                        <div className="flex items-center gap-2">
+                          <div
+                            className={`w-2 h-2 rounded-full ${
+                              connectionStatus === "connected"
+                                ? "bg-green-500"
+                                : connectionStatus === "connecting"
+                                  ? "bg-yellow-500"
+                                  : "bg-red-500"
+                            }`}
+                          />
+                          <span>{connectionStatus}</span>
+                        </div>
                       </div>
                     </div>
                   </TabsContent>
@@ -518,7 +684,7 @@ export default function ChatApp() {
           <div className="flex gap-2">
             <Button variant="outline" size="sm" className="flex-1 bg-transparent">
               <Users className="h-4 w-4 mr-2" />
-              Users ({users.length})
+              Users ({users.filter((u) => u.isOnline).length})
             </Button>
             <Button variant="outline" size="sm" className="flex-1 bg-transparent">
               <MessageCircle className="h-4 w-4 mr-2" />
@@ -530,28 +696,42 @@ export default function ChatApp() {
         {/* Online Users */}
         <div className="flex-1 p-4">
           <h3 className="text-sm font-medium text-sidebar-foreground mb-3">Online Users</h3>
+          {connectionStatus !== "connected" && (
+            <div className="text-center py-4">
+              <p className="text-xs text-muted-foreground mb-2">
+                {connectionStatus === "connecting" ? "Connecting to server..." : "Server disconnected"}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                Make sure the WebSocket server is running on localhost:8080
+              </p>
+            </div>
+          )}
           <div className="space-y-2">
-            {users.map((user) => (
-              <div
-                key={user.id}
-                className="flex items-center gap-3 p-2 rounded-lg hover:bg-sidebar-accent/10 transition-colors"
-              >
-                <Avatar className="h-8 w-8">
-                  <AvatarFallback style={{ backgroundColor: user.color }}>
-                    {user.name.slice(0, 2).toUpperCase()}
-                  </AvatarFallback>
-                </Avatar>
-                <div className="flex-1 min-w-0">
-                  <p className="text-sm font-medium text-sidebar-foreground truncate">{user.name}</p>
-                  <p className="text-xs text-muted-foreground">{user.ip}</p>
+            {users
+              .filter((u) => u.isOnline)
+              .map((user) => (
+                <div
+                  key={user.id}
+                  className="flex items-center gap-3 p-2 rounded-lg hover:bg-sidebar-accent/10 transition-colors"
+                >
+                  <Avatar className="h-8 w-8">
+                    <AvatarFallback
+                      style={{ backgroundColor: users.find((u) => u.name === user.name)?.color || "#ea580c" }}
+                    >
+                      {user.name.slice(0, 2).toUpperCase()}
+                    </AvatarFallback>
+                  </Avatar>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-sidebar-foreground truncate">{user.name}</p>
+                    <p className="text-xs text-muted-foreground">{user.ip}</p>
+                  </div>
+                  {user.isOnline && (
+                    <Badge variant="secondary" className="bg-green-100 text-green-800 text-xs">
+                      Online
+                    </Badge>
+                  )}
                 </div>
-                {user.isOnline && (
-                  <Badge variant="secondary" className="bg-green-100 text-green-800 text-xs">
-                    Online
-                  </Badge>
-                )}
-              </div>
-            ))}
+              ))}
           </div>
         </div>
       </div>
@@ -563,7 +743,10 @@ export default function ChatApp() {
           <div className="flex items-center justify-between">
             <div>
               <h1 className="text-xl font-semibold text-card-foreground">General Chat</h1>
-              <p className="text-sm text-muted-foreground">{users.length} users online</p>
+              <p className="text-sm text-muted-foreground">
+                {users.filter((u) => u.isOnline).length} users online
+                {connectionStatus !== "connected" && <span className="text-red-500 ml-2">• Server disconnected</span>}
+              </p>
             </div>
             <Dialog open={isSettingsOpen} onOpenChange={setIsSettingsOpen}>
               <DialogTrigger asChild>
@@ -578,6 +761,13 @@ export default function ChatApp() {
 
         {/* Messages */}
         <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          {connectionStatus !== "connected" && (
+            <div className="text-center py-4 bg-yellow-50 border border-yellow-200 rounded-lg">
+              <p className="text-sm text-yellow-800 mb-2">⚠️ Not connected to chat server</p>
+              <p className="text-xs text-yellow-600">Messages will not be sent until connection is restored</p>
+            </div>
+          )}
+
           {messages.length === 0 ? (
             <div className="text-center py-8">
               <MessageCircle className="h-12 w-12 text-muted-foreground mx-auto mb-4" />
@@ -660,7 +850,11 @@ export default function ChatApp() {
               className="flex-1 bg-input border-border"
             />
 
-            <Button onClick={sendMessage} disabled={!currentMessage.trim() && !selectedFile} className="flex-shrink-0">
+            <Button
+              onClick={sendMessage}
+              disabled={(!currentMessage.trim() && !selectedFile) || connectionStatus !== "connected"}
+              className="flex-shrink-0"
+            >
               <Send className="h-4 w-4" />
             </Button>
           </div>
